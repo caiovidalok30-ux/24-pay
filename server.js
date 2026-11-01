@@ -18,13 +18,27 @@ async function initialize(){
  }
  db.users ||= [];db.orders ||= [];
  db.pricing={...defaults,...(db.pricing||{})};
+ // Somente o e-mail configurado pode ter papel administrativo.
+ const configuredAdminEmail=(process.env.ADMIN_EMAIL||'').trim().toLowerCase();
+ let rolesChanged=false;
+ for(const account of db.users){
+  if(account.admin&&(!configuredAdminEmail||account.email!==configuredAdminEmail)){
+   account.admin=false;rolesChanged=true;
+  }
+ }
+ if(rolesChanged)await save();
+
  const adminEmail=(process.env.ADMIN_EMAIL||'').trim().toLowerCase();
  if(adminEmail){let admin=db.users.find(u=>u.email===adminEmail);if(admin&&!admin.admin){admin.admin=true;await save();console.log('Administrador autorizado via ADMIN_EMAIL');}}
 }
 const hash=(p,s)=>crypto.scryptSync(p,s,64).toString('hex');const tokens=new Map();
 function json(res,status,data){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(data))}
 function user(req){let token=(req.headers.authorization||'').replace(/^Bearer /,'');let id=tokens.get(token);return db.users.find(x=>x.id===id&&!x.blocked)}
-function publicUser(u){return {id:u.id,name:u.name,email:u.email,admin:u.admin,blocked:!!u.blocked,createdAt:u.createdAt}}
+function isAdmin(u){
+ const adminEmail=(process.env.ADMIN_EMAIL||'').trim().toLowerCase();
+ return !!(u&&u.admin===true&&adminEmail&&u.email===adminEmail&&!u.blocked);
+}
+function publicUser(u){return {id:u.id,name:u.name,email:u.email,admin:isAdmin(u),blocked:!!u.blocked,createdAt:u.createdAt}}
 async function body(req){let str='';for await(const c of req){str+=c;if(str.length>10000)throw Error('Requisição muito grande')}return JSON.parse(str||'{}')}
 const services={mobile:'Recarga de celular',sky:'Recarga SKY',boleto:'Pagamento de boleto',gift:'Gift card'};
 // Valores em centavos. Configuração inicial ilustrativa, sem contrato de fornecedor.
@@ -54,11 +68,11 @@ if(req.method==='POST'&&url.pathname==='/api/account/password'){
 }
 if(req.method==='GET'&&url.pathname==='/api/me')return json(res,200,{user:publicUser(u)});
 if(req.method==='POST'&&url.pathname==='/api/logout'){tokens.delete((req.headers.authorization||'').replace(/^Bearer /,''));return json(res,200,{ok:true})}
-if(req.method==='GET'&&url.pathname==='/api/pricing'){return json(res,200,{pricing:u.admin?db.pricing:Object.fromEntries(Object.entries(db.pricing).map(([k,v])=>[k,{commissionPct:v.commissionPct}]))});}
+if(req.method==='GET'&&url.pathname==='/api/pricing'){return json(res,200,{pricing:isAdmin(u)?db.pricing:Object.fromEntries(Object.entries(db.pricing).map(([k,v])=>[k,{commissionPct:v.commissionPct}]))});}
 if(req.method==='POST'&&url.pathname==='/api/quote'){let b=await body(req),q=calculate(String(b.service||''),b.amount);if(!q)return json(res,400,{error:'Serviço ou valor inválido.'});return json(res,200,{quote:{amountCents:q.amountCents,commissionCents:q.eligible?q.commissionCents:0,eligible:q.eligible},message:'Prévia demonstrativa; nenhuma comissão foi creditada.'});}
-if(req.method==='PUT'&&url.pathname==='/api/admin/pricing'){if(!u.admin)return json(res,403,{error:'Acesso restrito.'});let b=await body(req),service=String(b.service||''),config=b.config;if(!services[service]||!validPricing(config))return json(res,400,{error:'Configuração inválida ou margem mínima não protegida. A soma dos percentuais não pode superar 100%.'});db.pricing[service]={supplierPct:config.supplierPct,feePct:config.feePct,commissionPct:config.commissionPct,minProfitPct:config.minProfitPct};await save();return json(res,200,{ok:true,pricing:db.pricing});}
-if(req.method==='GET'&&url.pathname==='/api/admin/summary'){if(!u.admin)return json(res,403,{error:'Acesso restrito.'});return json(res,200,{mode:'demonstration',realizedProfitCents:0,paidCommissionCents:0,simulationCount:db.orders.length,byService:Object.fromEntries(Object.keys(services).map(k=>[k,{simulations:db.orders.filter(o=>o.service===k).length,realizedProfitCents:0}]))});}
-if(req.method==='GET'&&url.pathname==='/api/orders'){let orders=u.admin?db.orders:db.orders.filter(x=>x.userId===u.id);return json(res,200,{orders:orders.slice().reverse()})}
+if(req.method==='PUT'&&url.pathname==='/api/admin/pricing'){if(!isAdmin(u))return json(res,403,{error:'Acesso restrito.'});let b=await body(req),service=String(b.service||''),config=b.config;if(!services[service]||!validPricing(config))return json(res,400,{error:'Configuração inválida ou margem mínima não protegida. A soma dos percentuais não pode superar 100%.'});db.pricing[service]={supplierPct:config.supplierPct,feePct:config.feePct,commissionPct:config.commissionPct,minProfitPct:config.minProfitPct};await save();return json(res,200,{ok:true,pricing:db.pricing});}
+if(req.method==='GET'&&url.pathname==='/api/admin/summary'){if(!isAdmin(u))return json(res,403,{error:'Acesso restrito.'});return json(res,200,{mode:'demonstration',realizedProfitCents:0,paidCommissionCents:0,simulationCount:db.orders.length,byService:Object.fromEntries(Object.keys(services).map(k=>[k,{simulations:db.orders.filter(o=>o.service===k).length,realizedProfitCents:0}]))});}
+if(req.method==='GET'&&url.pathname==='/api/orders'){let orders=isAdmin(u)?db.orders:db.orders.filter(x=>x.userId===u.id);return json(res,200,{orders:orders.slice().reverse()})}
 if(req.method==='POST'&&url.pathname==='/api/orders'){let b=await body(req),amount=Number(b.amount),service=String(b.service||''),target=String(b.target||'').trim();if(!services[service]||!Number.isFinite(amount)||amount<1||amount>5000||target.length<3||target.length>150)return json(res,400,{error:'Preencha os dados corretamente. Valor entre R$ 1 e R$ 5.000.'});let q=calculate(service,amount);if(!q||!q.eligible)return json(res,400,{error:'Operação bloqueada: margem do proprietário insuficiente para pagar a comissão e os custos.'});let o={id:crypto.randomUUID(),userId:u.id,userName:u.name,service,serviceName:services[service],amount:Math.round(amount*100)/100,target,status:'simulação',commission:0,simulationQuote:{...q},pricingSnapshot:{...db.pricing[service]},createdAt:new Date().toISOString()};db.orders.push(o);await save();return json(res,201,{order:o,message:'Solicitação de demonstração registrada. Nenhum pagamento ou recarga foi realizado.'})}
 
 if(req.method==='GET'&&url.pathname==='/api/finance/summary'){
@@ -67,7 +81,7 @@ if(req.method==='GET'&&url.pathname==='/api/finance/summary'){
  return json(res,200,{mode:'demonstration',availableCommissionCents:0,paidCommissionCents:0,projectedCommissionCents:projected,simulations:own.length});
 }
 if(req.method==='GET'&&url.pathname==='/api/admin/finance'){
- if(!u.admin)return json(res,403,{error:'Acesso restrito.'});
+ if(!isAdmin(u))return json(res,403,{error:'Acesso restrito.'});
  const byService=Object.fromEntries(Object.keys(services).map(service=>{
   const orders=db.orders.filter(o=>o.service===service);
   const sum=field=>orders.reduce((total,o)=>total+(o.simulationQuote?.[field]||0),0);
@@ -83,17 +97,17 @@ if(req.method==='GET'&&url.pathname==='/api/admin/finance'){
  return json(res,200,{mode:'demonstration',realizedOwnerProfitCents:0,paidCommissionCents:0,availableCommissionCents:0,byService});
 }
 if(req.method==='PUT'&&url.pathname==='/api/admin/users/status'){
- if(!u.admin)return json(res,403,{error:'Acesso restrito.'});
+ if(!isAdmin(u))return json(res,403,{error:'Acesso restrito.'});
  const b=await body(req);
  if(typeof b.blocked!=='boolean')return json(res,400,{error:'Status inválido.'});
  const target=db.users.find(x=>x.id===String(b.userId||''));
  if(!target)return json(res,404,{error:'Usuário não encontrado.'});
- if(target.id===u.id||target.admin)return json(res,403,{error:'Não é permitido alterar o acesso de administradores.'});
+ if(target.id===u.id||isAdmin(target))return json(res,403,{error:'Não é permitido alterar o acesso de administradores.'});
  target.blocked=b.blocked;await save();
  if(target.blocked){for(const [t,id] of tokens){if(id===target.id)tokens.delete(t)}}
  return json(res,200,{ok:true,user:{...publicUser(target),blocked:!!target.blocked}});
 }
-if(req.method==='GET'&&url.pathname==='/api/admin/users'){if(!u.admin)return json(res,403,{error:'Acesso restrito.'});return json(res,200,{users:db.users.map(publicUser)})}
+if(req.method==='GET'&&url.pathname==='/api/admin/users'){if(!isAdmin(u))return json(res,403,{error:'Acesso restrito.'});return json(res,200,{users:db.users.map(publicUser)})}
 return json(res,404,{error:'Rota inexistente'});
 }catch(e){return json(res,400,{error:'Não foi possível processar a solicitação.'})}});
-initialize().then(()=>server.listen(PORT,'0.0.0.0',()=>console.log(`24 PAY v1.5 na porta ${PORT} (modo demonstração)`))).catch(e=>{console.error('Erro ao inicializar banco:',e.message);process.exit(1)});
+initialize().then(()=>server.listen(PORT,'0.0.0.0',()=>console.log(`24 PAY v1.5.1 na porta ${PORT} (modo demonstração)`))).catch(e=>{console.error('Erro ao inicializar banco:',e.message);process.exit(1)});
