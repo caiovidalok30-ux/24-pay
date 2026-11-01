@@ -78,7 +78,8 @@ if(req.method==='GET'&&url.pathname==='/api/admin/summary'){if(!isAdmin(u))retur
 if(req.method==='GET'&&url.pathname==='/api/orders'){let orders=isAdmin(u)?db.orders:db.orders.filter(x=>x.userId===u.id);return json(res,200,{orders:orders.slice().reverse()})}
 if(req.method==='POST'&&url.pathname==='/api/orders'){
  const b=await body(req),amount=Number(b.amount),service=String(b.service||''),target=String(b.target||'').trim();
- const requestId=String(b.requestId||'');
+ const providedRequestId=b.requestId;
+ const requestId=(providedRequestId===undefined||providedRequestId===null||providedRequestId==='')?crypto.randomUUID():String(providedRequestId);
  if(!/^[a-zA-Z0-9_-]{12,100}$/.test(requestId))return json(res,400,{error:'Identificador de solicitação inválido.'});
  if(!services[service]||!Number.isFinite(amount)||amount<1||amount>5000||target.length<3||target.length>150)return json(res,400,{error:'Preencha os dados corretamente. Valor entre R$ 1 e R$ 5.000.'});
  const key=u.id+':'+requestId;
@@ -139,4 +140,4 @@ if(req.method==='PUT'&&url.pathname==='/api/admin/users/status'){
 if(req.method==='GET'&&url.pathname==='/api/admin/users'){if(!isAdmin(u))return json(res,403,{error:'Acesso restrito.'});return json(res,200,{users:db.users.map(publicUser)})}
 return json(res,404,{error:'Rota inexistente'});
 }catch(e){return json(res,400,{error:'Não foi possível processar a solicitação.'})}});
-initialize().then(()=>server.listen(PORT,'0.0.0.0',()=>console.log(`24 PAY v1.6 na porta ${PORT} (modo demonstração)`))).catch(e=>{console.error('Erro ao inicializar banco:',e.message);process.exit(1)});
+initialize().then(()=>server.listen(PORT,'0.0.0.0',()=>console.log(`24 PAY v1.6.1 na porta ${PORT} (modo demonstração)`))).catch(e=>{console.error('Erro ao inicializar banco:',e.message);process.exit(1)});
