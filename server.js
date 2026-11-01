@@ -50,6 +50,19 @@ if(req.method==='PUT'&&url.pathname==='/api/admin/pricing'){if(!u.admin)return j
 if(req.method==='GET'&&url.pathname==='/api/admin/summary'){if(!u.admin)return json(res,403,{error:'Acesso restrito.'});return json(res,200,{mode:'demonstration',realizedProfitCents:0,paidCommissionCents:0,simulationCount:db.orders.length,byService:Object.fromEntries(Object.keys(services).map(k=>[k,{simulations:db.orders.filter(o=>o.service===k).length,realizedProfitCents:0}]))});}
 if(req.method==='GET'&&url.pathname==='/api/orders'){let orders=u.admin?db.orders:db.orders.filter(x=>x.userId===u.id);return json(res,200,{orders:orders.slice().reverse()})}
 if(req.method==='POST'&&url.pathname==='/api/orders'){let b=await body(req),amount=Number(b.amount),service=String(b.service||''),target=String(b.target||'').trim();if(!services[service]||!Number.isFinite(amount)||amount<1||amount>5000||target.length<3||target.length>150)return json(res,400,{error:'Preencha os dados corretamente. Valor entre R$ 1 e R$ 5.000.'});let q=calculate(service,amount);if(!q||!q.eligible)return json(res,400,{error:'Operação bloqueada: margem do proprietário insuficiente para pagar a comissão e os custos.'});let o={id:crypto.randomUUID(),userId:u.id,userName:u.name,service,serviceName:services[service],amount:Math.round(amount*100)/100,target,status:'simulação',commission:0,simulationQuote:{...q},pricingSnapshot:{...db.pricing[service]},createdAt:new Date().toISOString()};db.orders.push(o);await save();return json(res,201,{order:o,message:'Solicitação de demonstração registrada. Nenhum pagamento ou recarga foi realizado.'})}
+if(req.method==='GET'&&url.pathname==='/api/finance/summary'){
+ const own=db.orders.filter(o=>o.userId===u.id);
+ const total=own.reduce((a,o)=>a+(o.simulationQuote?.commissionCents||0),0);
+ return json(res,200,{mode:'demonstration',availableCommissionCents:0,paidCommissionCents:0,projectedCommissionCents:total,simulations:own.length});
+}
+if(req.method==='GET'&&url.pathname==='/api/admin/finance'){
+ if(!u.admin)return json(res,403,{error:'Acesso restrito.'});
+ const report=Object.fromEntries(Object.keys(services).map(k=>{
+  const rows=db.orders.filter(o=>o.service===k);
+  return [k,{simulations:rows.length,projectedRevenueCents:rows.reduce((a,o)=>a+(o.simulationQuote?.amountCents||0),0),projectedSupplierCostCents:rows.reduce((a,o)=>a+(o.simulationQuote?.supplierCents||0),0),projectedFeesCents:rows.reduce((a,o)=>a+(o.simulationQuote?.feeCents||0),0),projectedCommissionCents:rows.reduce((a,o)=>a+(o.simulationQuote?.commissionCents||0),0),projectedOwnerProfitCents:rows.reduce((a,o)=>a+(o.simulationQuote?.ownerProfitCents||0),0)}];
+ }));
+ return json(res,200,{mode:'demonstration',realizedOwnerProfitCents:0,paidCommissionCents:0,availableCommissionCents:0,byService:report});
+}
 if(req.method==='GET'&&url.pathname==='/api/admin/users'){if(!u.admin)return json(res,403,{error:'Acesso restrito.'});return json(res,200,{users:db.users.map(publicUser)})}
 return json(res,404,{error:'Rota inexistente'});
 }catch(e){return json(res,400,{error:'Não foi possível processar a solicitação.'})}});
