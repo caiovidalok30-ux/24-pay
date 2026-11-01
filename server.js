@@ -1,4 +1,3 @@
-
 const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto');
 const PORT=process.env.PORT||3000, SECRET=process.env.SESSION_SECRET||crypto.randomBytes(32).toString('hex');
 const DB=path.join(__dirname,'data.json');
@@ -24,8 +23,8 @@ async function initialize(){
 }
 const hash=(p,s)=>crypto.scryptSync(p,s,64).toString('hex');const tokens=new Map();
 function json(res,status,data){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(data))}
-function user(req){let token=(req.headers.authorization||'').replace(/^Bearer /,'');let id=tokens.get(token);return db.users.find(x=>x.id===id)}
-function publicUser(u){return {id:u.id,name:u.name,email:u.email,admin:u.admin,createdAt:u.createdAt}}
+function user(req){let token=(req.headers.authorization||'').replace(/^Bearer /,'');let id=tokens.get(token);return db.users.find(x=>x.id===id&&!x.blocked)}
+function publicUser(u){return {id:u.id,name:u.name,email:u.email,admin:u.admin,blocked:!!u.blocked,createdAt:u.createdAt}}
 async function body(req){let str='';for await(const c of req){str+=c;if(str.length>10000)throw Error('Requisição muito grande')}return JSON.parse(str||'{}')}
 const services={mobile:'Recarga de celular',sky:'Recarga SKY',boleto:'Pagamento de boleto',gift:'Gift card'};
 // Valores em centavos. Configuração inicial ilustrativa, sem contrato de fornecedor.
@@ -41,8 +40,18 @@ if(req.method==='GET'&&url.pathname==='/api/health')return json(res,200,{ok:true
 if(!url.pathname.startsWith('/api/'))return json(res,404,{error:'Não encontrado'});
 try{
 if(req.method==='POST'&&url.pathname==='/api/register'){let b=await body(req),name=String(b.name||'').trim(),email=String(b.email||'').trim().toLowerCase(),password=String(b.password||'');if(name.length<2||!/^\S+@\S+\.\S+$/.test(email)||password.length<8)return json(res,400,{error:'Informe nome, e-mail válido e senha de 8 caracteres ou mais.'});if(db.users.some(x=>x.email===email))return json(res,409,{error:'E-mail já cadastrado.'});let salt=crypto.randomBytes(16).toString('hex'),u={id:crypto.randomUUID(),name,email,salt,passwordHash:hash(password,salt),admin:false,createdAt:new Date().toISOString()};db.users.push(u);await save();return json(res,201,{ok:true})}
-if(req.method==='POST'&&url.pathname==='/api/login'){let b=await body(req),u=db.users.find(x=>x.email===String(b.email||'').trim().toLowerCase());if(!u)return json(res,401,{error:'Credenciais inválidas.'});let h=hash(String(b.password||''),u.salt);if(!crypto.timingSafeEqual(Buffer.from(h,'hex'),Buffer.from(u.passwordHash,'hex')))return json(res,401,{error:'Credenciais inválidas.'});let token=crypto.randomBytes(32).toString('hex');tokens.set(token,u.id);return json(res,200,{token,user:publicUser(u)})}
+if(req.method==='POST'&&url.pathname==='/api/login'){let b=await body(req),u=db.users.find(x=>x.email===String(b.email||'').trim().toLowerCase());if(!u||u.blocked)return json(res,401,{error:'Credenciais inválidas ou conta bloqueada.'});let h=hash(String(b.password||''),u.salt);if(!crypto.timingSafeEqual(Buffer.from(h,'hex'),Buffer.from(u.passwordHash,'hex')))return json(res,401,{error:'Credenciais inválidas.'});let token=crypto.randomBytes(32).toString('hex');tokens.set(token,u.id);return json(res,200,{token,user:publicUser(u)})}
 let u=user(req);if(!u)return json(res,401,{error:'Faça login para continuar.'});
+if(req.method==='POST'&&url.pathname==='/api/account/password'){
+ let b=await body(req),oldPassword=String(b.currentPassword||''),newPassword=String(b.newPassword||'');
+ if(newPassword.length<12||newPassword.length>128)return json(res,400,{error:'A nova senha deve ter entre 12 e 128 caracteres.'});
+ const oldHash=hash(oldPassword,u.salt);
+ if(!crypto.timingSafeEqual(Buffer.from(oldHash,'hex'),Buffer.from(u.passwordHash,'hex')))return json(res,403,{error:'Senha atual incorreta.'});
+ u.salt=crypto.randomBytes(16).toString('hex');u.passwordHash=hash(newPassword,u.salt);
+ await save();
+ for(const [t,id] of tokens){if(id===u.id&&t!==((req.headers.authorization||'').replace(/^Bearer /,'')))tokens.delete(t)}
+ return json(res,200,{ok:true,message:'Senha alterada.'});
+}
 if(req.method==='GET'&&url.pathname==='/api/me')return json(res,200,{user:publicUser(u)});
 if(req.method==='POST'&&url.pathname==='/api/logout'){tokens.delete((req.headers.authorization||'').replace(/^Bearer /,''));return json(res,200,{ok:true})}
 if(req.method==='GET'&&url.pathname==='/api/pricing'){return json(res,200,{pricing:u.admin?db.pricing:Object.fromEntries(Object.entries(db.pricing).map(([k,v])=>[k,{commissionPct:v.commissionPct}]))});}
@@ -73,7 +82,18 @@ if(req.method==='GET'&&url.pathname==='/api/admin/finance'){
  }));
  return json(res,200,{mode:'demonstration',realizedOwnerProfitCents:0,paidCommissionCents:0,availableCommissionCents:0,byService});
 }
+if(req.method==='PUT'&&url.pathname==='/api/admin/users/status'){
+ if(!u.admin)return json(res,403,{error:'Acesso restrito.'});
+ const b=await body(req);
+ if(typeof b.blocked!=='boolean')return json(res,400,{error:'Status inválido.'});
+ const target=db.users.find(x=>x.id===String(b.userId||''));
+ if(!target)return json(res,404,{error:'Usuário não encontrado.'});
+ if(target.id===u.id||target.admin)return json(res,403,{error:'Não é permitido alterar o acesso de administradores.'});
+ target.blocked=b.blocked;await save();
+ if(target.blocked){for(const [t,id] of tokens){if(id===target.id)tokens.delete(t)}}
+ return json(res,200,{ok:true,user:{...publicUser(target),blocked:!!target.blocked}});
+}
 if(req.method==='GET'&&url.pathname==='/api/admin/users'){if(!u.admin)return json(res,403,{error:'Acesso restrito.'});return json(res,200,{users:db.users.map(publicUser)})}
 return json(res,404,{error:'Rota inexistente'});
 }catch(e){return json(res,400,{error:'Não foi possível processar a solicitação.'})}});
-initialize().then(()=>server.listen(PORT,'0.0.0.0',()=>console.log(`24 PAY v1.3 na porta ${PORT} (modo demonstração)`))).catch(e=>{console.error('Erro ao inicializar banco:',e.message);process.exit(1)});
+initialize().then(()=>server.listen(PORT,'0.0.0.0',()=>console.log(`24 PAY v1.5 na porta ${PORT} (modo demonstração)`))).catch(e=>{console.error('Erro ao inicializar banco:',e.message);process.exit(1)});
