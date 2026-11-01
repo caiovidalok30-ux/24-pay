@@ -16,7 +16,7 @@ async function initialize(){
   await pool.query('INSERT INTO app_state(id,payload) VALUES(1,$1::jsonb) ON CONFLICT(id) DO NOTHING',[JSON.stringify(db)]);
   const r=await pool.query('SELECT payload FROM app_state WHERE id=1');db=r.rows[0].payload;
  }
- db.users ||= [];db.orders ||= [];
+ db.users ||= [];db.orders ||= [];db.audit ||= [];
  db.pricing={...defaults,...(db.pricing||{})};
  // Somente o e-mail configurado pode ter papel administrativo.
  const configuredAdminEmail=(process.env.ADMIN_EMAIL||'').trim().toLowerCase();
@@ -44,6 +44,9 @@ const services={mobile:'Recarga de celular',sky:'Recarga SKY',boleto:'Pagamento 
 // Valores em centavos. Configuração inicial ilustrativa, sem contrato de fornecedor.
 const defaults={mobile:{supplierPct:92,feePct:1,commissionPct:3,minProfitPct:2},sky:{supplierPct:93,feePct:1,commissionPct:2,minProfitPct:2},boleto:{supplierPct:96,feePct:1,commissionPct:1,minProfitPct:1},gift:{supplierPct:91,feePct:2,commissionPct:3,minProfitPct:2}};
 const cents=v=>Math.round(Number(v)*100);
+const audit=(actor,action,details={})=>{db.audit.push({id:crypto.randomUUID(),at:new Date().toISOString(),actorId:actor?.id||null,action,details});if(db.audit.length>5000)db.audit=db.audit.slice(-5000)};
+const orderBusy=new Set();
+
 function calculate(service,amount){const c=db.pricing[service];if(!c)return null;const gross=cents(amount);if(!Number.isSafeInteger(gross)||gross<100||gross>500000)return null;
  const supplier=Math.round(gross*c.supplierPct/100),fee=Math.round(gross*c.feePct/100),commission=Math.round(gross*c.commissionPct/100),profit=gross-supplier-fee-commission,minProfit=Math.ceil(gross*c.minProfitPct/100);
  return {amountCents:gross,supplierCents:supplier,feeCents:fee,commissionCents:commission,ownerProfitCents:profit,minProfitCents:minProfit,eligible:profit>=minProfit&&profit>=0};}
@@ -62,7 +65,7 @@ if(req.method==='POST'&&url.pathname==='/api/account/password'){
  const oldHash=hash(oldPassword,u.salt);
  if(!crypto.timingSafeEqual(Buffer.from(oldHash,'hex'),Buffer.from(u.passwordHash,'hex')))return json(res,403,{error:'Senha atual incorreta.'});
  u.salt=crypto.randomBytes(16).toString('hex');u.passwordHash=hash(newPassword,u.salt);
- await save();
+ audit(u,'password_changed');await save();
  for(const [t,id] of tokens){if(id===u.id&&t!==((req.headers.authorization||'').replace(/^Bearer /,'')))tokens.delete(t)}
  return json(res,200,{ok:true,message:'Senha alterada.'});
 }
@@ -70,10 +73,36 @@ if(req.method==='GET'&&url.pathname==='/api/me')return json(res,200,{user:public
 if(req.method==='POST'&&url.pathname==='/api/logout'){tokens.delete((req.headers.authorization||'').replace(/^Bearer /,''));return json(res,200,{ok:true})}
 if(req.method==='GET'&&url.pathname==='/api/pricing'){return json(res,200,{pricing:isAdmin(u)?db.pricing:Object.fromEntries(Object.entries(db.pricing).map(([k,v])=>[k,{commissionPct:v.commissionPct}]))});}
 if(req.method==='POST'&&url.pathname==='/api/quote'){let b=await body(req),q=calculate(String(b.service||''),b.amount);if(!q)return json(res,400,{error:'Serviço ou valor inválido.'});return json(res,200,{quote:{amountCents:q.amountCents,commissionCents:q.eligible?q.commissionCents:0,eligible:q.eligible},message:'Prévia demonstrativa; nenhuma comissão foi creditada.'});}
-if(req.method==='PUT'&&url.pathname==='/api/admin/pricing'){if(!isAdmin(u))return json(res,403,{error:'Acesso restrito.'});let b=await body(req),service=String(b.service||''),config=b.config;if(!services[service]||!validPricing(config))return json(res,400,{error:'Configuração inválida ou margem mínima não protegida. A soma dos percentuais não pode superar 100%.'});db.pricing[service]={supplierPct:config.supplierPct,feePct:config.feePct,commissionPct:config.commissionPct,minProfitPct:config.minProfitPct};await save();return json(res,200,{ok:true,pricing:db.pricing});}
+if(req.method==='PUT'&&url.pathname==='/api/admin/pricing'){if(!isAdmin(u))return json(res,403,{error:'Acesso restrito.'});let b=await body(req),service=String(b.service||''),config=b.config;if(!services[service]||!validPricing(config))return json(res,400,{error:'Configuração inválida ou margem mínima não protegida. A soma dos percentuais não pode superar 100%.'});db.pricing[service]={supplierPct:config.supplierPct,feePct:config.feePct,commissionPct:config.commissionPct,minProfitPct:config.minProfitPct};audit(u,'pricing_changed',{service,config:db.pricing[service]});await save();return json(res,200,{ok:true,pricing:db.pricing});}
 if(req.method==='GET'&&url.pathname==='/api/admin/summary'){if(!isAdmin(u))return json(res,403,{error:'Acesso restrito.'});return json(res,200,{mode:'demonstration',realizedProfitCents:0,paidCommissionCents:0,simulationCount:db.orders.length,byService:Object.fromEntries(Object.keys(services).map(k=>[k,{simulations:db.orders.filter(o=>o.service===k).length,realizedProfitCents:0}]))});}
 if(req.method==='GET'&&url.pathname==='/api/orders'){let orders=isAdmin(u)?db.orders:db.orders.filter(x=>x.userId===u.id);return json(res,200,{orders:orders.slice().reverse()})}
-if(req.method==='POST'&&url.pathname==='/api/orders'){let b=await body(req),amount=Number(b.amount),service=String(b.service||''),target=String(b.target||'').trim();if(!services[service]||!Number.isFinite(amount)||amount<1||amount>5000||target.length<3||target.length>150)return json(res,400,{error:'Preencha os dados corretamente. Valor entre R$ 1 e R$ 5.000.'});let q=calculate(service,amount);if(!q||!q.eligible)return json(res,400,{error:'Operação bloqueada: margem do proprietário insuficiente para pagar a comissão e os custos.'});let o={id:crypto.randomUUID(),userId:u.id,userName:u.name,service,serviceName:services[service],amount:Math.round(amount*100)/100,target,status:'simulação',commission:0,simulationQuote:{...q},pricingSnapshot:{...db.pricing[service]},createdAt:new Date().toISOString()};db.orders.push(o);await save();return json(res,201,{order:o,message:'Solicitação de demonstração registrada. Nenhum pagamento ou recarga foi realizado.'})}
+if(req.method==='POST'&&url.pathname==='/api/orders'){
+ const b=await body(req),amount=Number(b.amount),service=String(b.service||''),target=String(b.target||'').trim();
+ const requestId=String(b.requestId||'');
+ if(!/^[a-zA-Z0-9_-]{12,100}$/.test(requestId))return json(res,400,{error:'Identificador de solicitação inválido.'});
+ if(!services[service]||!Number.isFinite(amount)||amount<1||amount>5000||target.length<3||target.length>150)return json(res,400,{error:'Preencha os dados corretamente. Valor entre R$ 1 e R$ 5.000.'});
+ const key=u.id+':'+requestId;
+ const prior=db.orders.find(o=>o.userId===u.id&&o.requestId===requestId);
+ if(prior)return json(res,200,{order:prior,duplicate:true,message:'Esta simulação já foi registrada. Nenhum registro duplicado foi criado.'});
+ if(orderBusy.has(key))return json(res,409,{error:'Solicitação em processamento. Aguarde e atualize o histórico.'});
+ const q=calculate(service,amount);
+ if(!q||!q.eligible)return json(res,400,{error:'Operação bloqueada: margem do proprietário insuficiente para pagar a comissão e os custos.'});
+ orderBusy.add(key);
+ try{
+  const o={id:crypto.randomUUID(),requestId,userId:u.id,userName:u.name,service,serviceName:services[service],amount:Math.round(amount*100)/100,target,status:'simulação',commission:0,simulationQuote:{...q},pricingSnapshot:{...db.pricing[service]},createdAt:new Date().toISOString()};
+  db.orders.push(o);audit(u,'simulation_created',{orderId:o.id,service,amountCents:q.amountCents});
+  try{await save()}catch(e){db.orders=db.orders.filter(x=>x.id!==o.id);db.audit=db.audit.filter(x=>x.details?.orderId!==o.id);throw e}
+  return json(res,201,{order:o,duplicate:false,message:'Simulação registrada. Nenhum pagamento ou recarga foi realizado.'});
+ }finally{orderBusy.delete(key)}
+}
+if(req.method==='GET'&&url.pathname==='/api/finance/history'){
+ const own=db.orders.filter(o=>o.userId===u.id).slice().reverse();
+ return json(res,200,{mode:'demonstration',entries:own.map(o=>({id:o.id,createdAt:o.createdAt,serviceName:o.serviceName,status:o.status,amountCents:o.simulationQuote?.amountCents||cents(o.amount),projectedCommissionCents:o.simulationQuote?.commissionCents||0,availableCommissionCents:0,paidCommissionCents:0}))});
+}
+if(req.method==='GET'&&url.pathname==='/api/admin/audit'){
+ if(!isAdmin(u))return json(res,403,{error:'Acesso restrito.'});
+ return json(res,200,{events:db.audit.slice(-100).reverse()});
+}
 
 if(req.method==='GET'&&url.pathname==='/api/finance/summary'){
  const own=db.orders.filter(o=>o.userId===u.id);
@@ -103,11 +132,11 @@ if(req.method==='PUT'&&url.pathname==='/api/admin/users/status'){
  const target=db.users.find(x=>x.id===String(b.userId||''));
  if(!target)return json(res,404,{error:'Usuário não encontrado.'});
  if(target.id===u.id||isAdmin(target))return json(res,403,{error:'Não é permitido alterar o acesso de administradores.'});
- target.blocked=b.blocked;await save();
+ target.blocked=b.blocked;audit(u,'user_status_changed',{userId:target.id,blocked:target.blocked});await save();
  if(target.blocked){for(const [t,id] of tokens){if(id===target.id)tokens.delete(t)}}
  return json(res,200,{ok:true,user:{...publicUser(target),blocked:!!target.blocked}});
 }
 if(req.method==='GET'&&url.pathname==='/api/admin/users'){if(!isAdmin(u))return json(res,403,{error:'Acesso restrito.'});return json(res,200,{users:db.users.map(publicUser)})}
 return json(res,404,{error:'Rota inexistente'});
 }catch(e){return json(res,400,{error:'Não foi possível processar a solicitação.'})}});
-initialize().then(()=>server.listen(PORT,'0.0.0.0',()=>console.log(`24 PAY v1.5.1 na porta ${PORT} (modo demonstração)`))).catch(e=>{console.error('Erro ao inicializar banco:',e.message);process.exit(1)});
+initialize().then(()=>server.listen(PORT,'0.0.0.0',()=>console.log(`24 PAY v1.6 na porta ${PORT} (modo demonstração)`))).catch(e=>{console.error('Erro ao inicializar banco:',e.message);process.exit(1)});
